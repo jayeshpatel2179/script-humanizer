@@ -299,3 +299,33 @@ def test_extract_and_normalise():
         {"paragraph": {"elements": [{"textRun": {"content": "\n"}}]}},
     ]
     assert gdoc.normalise(gdoc._extract(content)) == "Line one\nstill one\ncell"
+
+
+# --- Google credentials problems (Railway variable missing / pasted wrong) -------------
+
+
+@pytest.fixture
+def no_service(monkeypatch):
+    monkeypatch.setattr(gdoc, "_service", None)
+
+
+def test_missing_credentials_is_a_clear_doc_error(monkeypatch, no_service, tmp_path):
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_FILE", str(tmp_path / "missing.json"))
+    assert gdoc.credentials_problem() == gdoc.MISSING_CREDENTIALS
+    with pytest.raises(gdoc.DocError, match="GOOGLE_SERVICE_ACCOUNT_JSON"):
+        gdoc._read_sync("doc", "t.0")
+
+
+@pytest.mark.parametrize("value", ["{not json", '{"type": "service_account"}', '"just a string"'])
+def test_bad_credentials_json_is_a_clear_doc_error(monkeypatch, no_service, value):
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON", value)
+    assert gdoc.credentials_problem() == gdoc.BAD_CREDENTIALS
+    with pytest.raises(gdoc.DocError, match="isn't a valid service-account key"):
+        gdoc._read_sync("doc", "t.0")
+
+
+def test_valid_looking_credentials_pass_the_startup_check(monkeypatch):
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON",
+                        '{"type": "service_account", "client_email": "a@b.iam.gserviceaccount.com", "private_key": "k"}')
+    assert gdoc.credentials_problem() is None

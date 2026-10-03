@@ -9,6 +9,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -46,14 +47,39 @@ def doc_url(doc_id: str | None = None, tab_id: str | None = None) -> str:
     return f"https://docs.google.com/document/d/{doc_id or config.GOOGLE_DOC_ID}/edit?tab={tab_id or config.GOOGLE_DOC_TAB_ID}"
 
 
+MISSING_CREDENTIALS = ("Google credentials are missing. On Railway, set GOOGLE_SERVICE_ACCOUNT_JSON to the "
+                       "whole contents of the service-account key file.")
+BAD_CREDENTIALS = ("GOOGLE_SERVICE_ACCOUNT_JSON isn't a valid service-account key. Paste the whole key file "
+                   "again, from { to }.")
+
+
+def credentials_problem() -> str | None:
+    """A message if Doc mode can't possibly authenticate, checked at startup. None if it looks fine."""
+    if config.GOOGLE_SERVICE_ACCOUNT_JSON:
+        try:
+            info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_JSON)
+        except ValueError:
+            return BAD_CREDENTIALS
+        return None if isinstance(info, dict) and info.get("private_key") and info.get("client_email") else BAD_CREDENTIALS
+    if not Path(config.GOOGLE_SERVICE_ACCOUNT_FILE).is_file():
+        return MISSING_CREDENTIALS
+    return None
+
+
 def _get_service():
     global _service
     if _service is None:
-        if config.GOOGLE_SERVICE_ACCOUNT_JSON:
-            info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_JSON)
-            creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-        else:
-            creds = service_account.Credentials.from_service_account_file(config.GOOGLE_SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        if problem := credentials_problem():
+            raise DocError(problem)
+        try:
+            if config.GOOGLE_SERVICE_ACCOUNT_JSON:
+                info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_JSON)
+                creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+            else:
+                creds = service_account.Credentials.from_service_account_file(config.GOOGLE_SERVICE_ACCOUNT_FILE,
+                                                                              scopes=SCOPES)
+        except (ValueError, KeyError) as exc:  # malformed key contents
+            raise DocError(BAD_CREDENTIALS) from exc
         _service = build("docs", "v1", credentials=creds, cache_discovery=False)
     return _service
 

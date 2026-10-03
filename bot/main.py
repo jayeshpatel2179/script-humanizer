@@ -2,9 +2,10 @@ import logging
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import ChatMigrated, Conflict
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-from bot import config
+from bot import config, gdoc
 from bot.docmode import (
     GO_HUMANIZE_RE,
     MENU,
@@ -53,12 +54,23 @@ async def on_text_or_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled exception while processing an update", exc_info=context.error)
+    error = context.error
+    if isinstance(error, Conflict):
+        # Telegram allows one poller per token. Once right after a deploy is the old container
+        # shutting down; if it keeps repeating, another copy (e.g. a local bot) is running.
+        logger.warning("Another copy of this bot is running with the same token - stop the other one. (%s)", error)
+    elif isinstance(error, ChatMigrated):
+        logger.warning("A group was upgraded to a supergroup (new chat id %s). That one reply was lost; "
+                       "messages sent from now on work.", error.new_chat_id)
+    else:
+        logger.exception("Unhandled exception while processing an update", exc_info=error)
 
 
 def build_application() -> Application:
     token = config.require("TELEGRAM_BOT_TOKEN")
     config.require("OPENAI_API_KEY")
+    if config.GOOGLE_DOC_ID and (problem := gdoc.credentials_problem()):
+        logger.error("Doc mode can't reach Google: %s", problem)
     if not config.ALLOWED_USER_IDS:
         logger.warning("ALLOWED_USER_IDS is empty - anyone who finds the bot can use it.")
 

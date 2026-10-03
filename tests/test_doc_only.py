@@ -411,3 +411,14 @@ def test_unauthorised_user_is_refused(doc, monkeypatch):
     chat = Chat()
     run(docmode.on_go_humanize(typed(chat, "go humanize"), ctx()))
     assert doc["reads"] == 0 and last(chat)[1].startswith("This bot is private.")
+
+
+def test_missing_google_key_gets_a_reply_not_silence(doc, monkeypatch):
+    async def read_doc():
+        raise gdoc.DocError(gdoc.MISSING_CREDENTIALS)
+
+    monkeypatch.setattr(gdoc, "read_doc", read_doc)
+    chat = Chat()
+    humanize_by_tap(chat)
+    assert last(chat)[1] == f"Couldn't read the Doc: {gdoc.MISSING_CREDENTIALS}"
+    assert doc["writes"] == []
