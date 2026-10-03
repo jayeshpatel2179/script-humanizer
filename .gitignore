@@ -1,0 +1,15 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+bot.log
+*_humanized.txt
+
+# Google service account key - never commit
+google-service-account.json
+*service-account*.json
+
+# Bot state: hashes and backups (persistent volume on Railway)
+storage/
