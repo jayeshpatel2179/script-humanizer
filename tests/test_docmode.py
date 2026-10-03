@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from bot import docflow, emotion, gdoc
-from bot.docflow import GateFailure, check_structure, process_script
+from bot.docflow import GateFailure, check_structure
 from bot.docmode import GO_HUMANIZE_RE
 from bot.llm import EditResult
 from bot.pipeline import HumanizeResult
@@ -108,7 +108,7 @@ def test_structure_catches_missing_outro_and_added_chapter():
     assert any("Chapter" in f for f in failures)
 
 
-# --- full flow with a fake model ---------------------------------------------
+# --- the two steps with a fake model ---------------------------------------------
 
 
 def _fake_humanize(script: str) -> HumanizeResult:
@@ -117,8 +117,8 @@ def _fake_humanize(script: str) -> HumanizeResult:
     return HumanizeResult(text=text, report="", truncated=False)
 
 
-def _fake_emotion_llm(text: str, system_prompt: str) -> EditResult:
-    # Insert a cue before every third paragraph, keep placeholders, leave one "genuine" for code to catch.
+def _cue_every_third_paragraph(text: str, system_prompt: str = "") -> EditResult:
+    # Mixed-case cue to check it gets normalised; placeholders untouched.
     paras = text.split("\n\n")
     out = [f"[Thoughtful] {p}" if i % 3 == 0 and not p.startswith("@@") else p for i, p in enumerate(paras)]
     return EditResult(text="\n\n".join(out), truncated=False)
@@ -128,69 +128,112 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_process_script_end_to_end(monkeypatch):
-    calls = {"humanize": 0, "emotion": 0}
-
-    async def humanize(script):
-        calls["humanize"] += 1
-        return _fake_humanize(script)
-
-    async def edit_script(text, system_prompt):
-        calls["emotion"] += 1
-        return _fake_emotion_llm(text, system_prompt)
-
-    monkeypatch.setattr(docflow, "humanize", humanize)
-    monkeypatch.setattr(emotion, "edit_script", edit_script)
+@pytest.fixture
+def brackets(monkeypatch):
     monkeypatch.setattr(emotion.config, "CUE_STYLE", "brackets")
 
-    source = _load("real_madrid_inter.txt")
-    outcome = _run(process_script(source))
 
-    assert calls == {"humanize": 1, "emotion": 1}
+def test_run_humanize_adds_no_cues_and_strips_genuine(monkeypatch, brackets):
+    calls = {"n": 0}
+
+    async def humanize(script):
+        calls["n"] += 1
+        return _fake_humanize(script)
+
+    monkeypatch.setattr(docflow, "humanize", humanize)
+    outcome = _run(docflow.run_humanize(_load("real_madrid_inter.txt")))
+
+    assert calls["n"] == 1
     assert not emotion.GENUINE_RE.search(outcome.text)
-    assert "[thoughtful]" in outcome.text and "[Thoughtful]" not in outcome.text
-    for header in ("[Editor note:", "Short One. Hello editor", "Short Two. Hello editor", "Difficult to pronounce"):
-        assert header in outcome.text
+    assert docflow.cue_sequence(outcome.text) == []
     report = "\n".join(outcome.report_lines)
-    assert "genuine(ly) x27" in report
-    assert "Checks: intro ok, outro ok, Short 1 ok, Short 2 ok, names/numbers ok" in report
-    assert "Emotion cues: 0 in, " in report
+    assert "<b>genuine(ly)</b> x27" in report
     assert "\"let's talk about\" x13 → varied" in report
+    assert "🔎 <b>Checks:</b> intro ✅ outro ✅ Short 1 ✅ Short 2 ✅ names/numbers ✅" in report
+    assert "Emotion cues" not in report and "Existing cues kept" not in report
 
 
-def test_emotion_rewrite_fails_gate_after_one_retry(monkeypatch):
-    calls = {"emotion": 0}
-
+def test_run_humanize_reports_existing_cues(monkeypatch, brackets):
     async def humanize(script):
-        return _fake_humanize(script)
-
-    async def edit_script(text, system_prompt):
-        calls["emotion"] += 1
-        # Rewrites the whole body - the similarity check must catch it.
-        lines = text.split("\n\n")
-        return EditResult(text="\n\n".join(p if p.startswith("@@") else "Totally different words here." for p in lines),
-                          truncated=False)
+        return HumanizeResult(text=script, report="")
 
     monkeypatch.setattr(docflow, "humanize", humanize)
-    monkeypatch.setattr(emotion, "edit_script", edit_script)
-    monkeypatch.setattr(emotion.config, "CUE_STYLE", "brackets")
-
-    with pytest.raises(GateFailure) as info:
-        _run(process_script(_load("real_madrid_inter.txt")))
-    assert info.value.stage == "Emotion pass"
-    assert calls["emotion"] == 2
-    assert any("similarity" in f for f in info.value.failures)
+    source = _load("real_madrid_inter.txt").replace("Porto host", "[curious] Porto host", 1)
+    outcome = _run(docflow.run_humanize(source))
+    assert "🎭 <b>Existing cues kept:</b> 1" in "\n".join(outcome.report_lines)
 
 
-def test_truncated_humanize_fails_gate(monkeypatch):
+def test_truncated_humanize_fails_after_one_retry(monkeypatch):
+    calls = {"n": 0}
+
     async def humanize(script):
+        calls["n"] += 1
         return HumanizeResult(text=script, report="", truncated=True)
 
     monkeypatch.setattr(docflow, "humanize", humanize)
     with pytest.raises(GateFailure) as info:
-        _run(process_script(_load("fc27_review.txt")))
-    assert info.value.stage == "Humanize pass"
+        _run(docflow.run_humanize(_load("fc27_review.txt")))
+    assert calls["n"] == 2 and info.value.stage == "Go Humanize"
     assert any("cut off" in f for f in info.value.failures)
+
+
+def _humanized(name: str) -> str:
+    return emotion.strip_genuine(_fake_humanize(_load(name)).text)[0]
+
+
+def test_run_emotion_only_adds_cues(monkeypatch, brackets):
+    async def edit_script(text, system_prompt):
+        return _cue_every_third_paragraph(text)
+
+    monkeypatch.setattr(emotion, "edit_script", edit_script)
+    source = _humanized("real_madrid_inter.txt")
+    outcome = _run(docflow.run_emotion(source))
+
+    assert docflow.normalise_ws(emotion.strip_cues(outcome.text)) == docflow.normalise_ws(source)
+    cues = docflow.cue_sequence(outcome.text)
+    assert cues and set(cues) == {"[thoughtful]"}
+    for header in ("[Editor note:", "Short One. Hello editor", "Short Two. Hello editor", "Difficult to pronounce"):
+        assert header in outcome.text
+    report = "\n".join(outcome.report_lines)
+    assert f"🎭 <b>Cues added:</b> {len(cues)} (thoughtful {len(cues)})" in report
+    assert "script text unchanged ✅ Short headers untouched ✅ no cues on editor notes ✅" in report
+
+
+@pytest.mark.parametrize("damage, expected", [
+    (lambda t: t.replace("Porto host", "Porto welcome", 1), "Script text changed"),
+    # The model only sees placeholders for headers; a cue in front of one lands on the restored header line.
+    (lambda t: t.replace("@@KEEP_3@@", "[calm] @@KEEP_3@@", 1), "Short headers"),
+    (lambda t: t.replace("Porto host", "(excited) Porto host", 1), "Script text changed"),
+    (lambda t: t.replace("Porto host", "[Excited!] Porto host", 1), "Cue not in the [emotion] format"),
+    (lambda t: t.replace("[Thoughtful] ", ""), "No emotion cues were added"),
+])
+def test_emotion_gate_catches(monkeypatch, brackets, damage, expected):
+    calls = {"n": 0}
+
+    async def edit_script(text, system_prompt):
+        calls["n"] += 1
+        return EditResult(text=damage(_cue_every_third_paragraph(text).text), truncated=False)
+
+    monkeypatch.setattr(emotion, "edit_script", edit_script)
+    with pytest.raises(GateFailure) as info:
+        _run(docflow.run_emotion(_humanized("real_madrid_inter.txt")))
+    assert calls["n"] == 2 and info.value.stage == "Add Emotion"
+    assert any(expected in f for f in info.value.failures), info.value.failures
+
+
+def test_report_escapes_html(monkeypatch, brackets):
+    source = _load("fc27_review.txt")
+    report = "\n".join(docflow.humanize_report(source, source, ['a <genuine> & "odd" line']))
+    assert "<genuine>" not in report
+    assert "a &lt;genuine&gt; &amp; \"odd\" line" in report
+    # Only our own tags remain once escaped text is removed.
+    assert set(re.findall(r"</?(\w+)", report)) == {"b"}
+
+
+def test_by_section_escapes_titles(monkeypatch, brackets):
+    body = ("Intro line here.\n\nR&D <Plans>\n\n[curious] Text one.\n\nThe Next Bit\n\n[calm] Text two.")
+    line = docflow._by_section(emotion.strip_cues(body), body)
+    assert line == "🗂 <b>By section:</b> Intro: 0; R&amp;D &lt;Plans&gt;: 1; The Next Bit: 1"
 
 
 # --- Google Docs request shape (no network) ------------------------------------

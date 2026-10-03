@@ -23,7 +23,7 @@ BUSY_KEY = "busy"
 POINTER_SENT_KEY = "doc_pointer_sent_at"
 TELEGRAM_TEXT_LIMIT = 4096
 
-DOC_POINTER = "I work from the Google Doc now. Paste the script into the Doc, then send: go humanize"
+DOC_POINTER = "I work from the Google Doc now. Paste the script into the Doc, then send any message."
 # A long paste arrives as several messages - answer the first, not every chunk.
 POINTER_COOLDOWN_SECONDS = 60
 

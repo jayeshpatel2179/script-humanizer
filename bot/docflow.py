@@ -1,13 +1,18 @@
-"""Doc mode processing: Humanize pass → Emotion pass → validation gate → report.
+"""Doc mode processing, as two separate steps:
+
+- Humanize: Humanize pass → "genuine" strip → gate → report. Adds no cues.
+- Emotion:  Emotion-cue pass (with its "genuine" strip) → gate → report.
 
 No Telegram or Google code here, so it can be tested with a fake model.
-Every number in the report is computed from the before/after text.
+Every number in a report is computed from the before/after text. Reports are
+Telegram HTML, and every dynamic string is escaped.
 """
 
 import difflib
+import html
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from bot import config
 from bot.emotion import GENUINE_RE, EmotionResult, add_emotion, cue_pattern, strip_cues, strip_genuine
@@ -21,6 +26,9 @@ SHORT_HEADER_RES = {
 }
 OUTRO_RE = re.compile(r"if\s+you\s+liked?\s+watching\s+this", re.IGNORECASE)
 CHAPTER_RE = re.compile(r"(?im)^\s*chapter\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b")
+BRACKET_TOKEN_RE = re.compile(r"\[[^\[\]\n]{1,60}\]")
+
+OK, BAD = "✅", "❌"
 
 
 class GateFailure(Exception):
@@ -30,13 +38,20 @@ class GateFailure(Exception):
 
 
 @dataclass
-class DocOutcome:
-    text: str
-    report_lines: list[str]
-    warnings: list[str] = field(default_factory=list)
+class StepOutcome:
+    text: str  # what gets written to the Doc
+    report_lines: list[str]  # Telegram HTML, without the title/link header and the closing line
 
 
-# --- validation gate ---------------------------------------------------------
+def esc(value: object) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def normalise_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+# --- structure checks (shared) ------------------------------------------------
 
 
 def _header_lines(text: str) -> dict[str, tuple[int, str]]:
@@ -100,75 +115,43 @@ def cue_sequence(text: str) -> list[str]:
     return pattern.findall(text) if pattern else []
 
 
-def _is_subsequence(needle: list[str], haystack: list[str]) -> bool:
-    it = iter(haystack)
-    return all(token in it for token in needle)
+def _first_difference(expected: str, actual: str) -> str:
+    """Short description of the first word-level difference, for failure messages."""
+    a, b = expected.split(), actual.split()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag != "equal":
+            before = " ".join(a[i1:i2][:6]) or "(nothing)"
+            after = " ".join(b[j1:j2][:6]) or "(nothing)"
+            return f'"{before}" became "{after}"'
+    return "whitespace only"
 
 
-def check_humanize(source: str, result: HumanizeResult) -> list[str]:
-    failures, _ = check_structure(source, result.text)
+# --- step 1: Humanize -------------------------------------------------------------
+
+
+def check_humanize(source: str, result: HumanizeResult, cleaned: str) -> list[str]:
+    failures, _ = check_structure(source, cleaned)
     if result.truncated:
         failures.append("Humanize output was cut off by the model's output limit")
-    if failure := _length_failure(source, result.text):
+    if failure := _length_failure(source, cleaned):
         failures.append(failure)
-    # The Humanize pass adds no cues, so cues already in the script must come through
-    # as the exact same ordered sequence - none dropped, duplicated or reordered.
-    if cue_sequence(result.text) != cue_sequence(source):
-        failures.append("Emotion cues already in the script were dropped, duplicated or reordered")
+    # Humanize adds no cues: cues already in the script must come through as the
+    # exact same ordered sequence - none dropped, duplicated, reordered or added.
+    if cue_sequence(cleaned) != cue_sequence(source):
+        failures.append("Emotion cues in the script were dropped, added or reordered")
     return failures
 
 
-def similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a.lower().split(), b.lower().split(), autojunk=False).ratio()
-
-
-def check_emotion(source: str, stage1: str, result: EmotionResult) -> list[str]:
-    final = result.text
-    failures, _ = check_structure(source, final)
-    if result.truncated:
-        failures.append("Emotion output was cut off by the model's output limit")
-    if GENUINE_RE.search(final):
-        failures.append('"genuine/genuinely" still present')
-    if failure := _length_failure(source, final):
-        failures.append(failure)
-    # This pass adds cues on purpose, so the input's cues must all still be there,
-    # in order, with new ones allowed in between.
-    if not _is_subsequence(cue_sequence(source), cue_sequence(final)):
-        failures.append("Emotion cues already in the script were dropped or reordered")
-    if not result.skipped:
-        # Cues come off both sides, so cues already in the script don't count as rewriting.
-        expected = strip_cues(strip_genuine(stage1)[0])
-        score = similarity(expected, strip_cues(final))
-        if score < config.CUE_SIMILARITY_MIN:
-            failures.append(f"Emotion pass rewrote text instead of only adding cues "
-                            f"(similarity {score:.0%}, need {config.CUE_SIMILARITY_MIN:.0%})")
-        pattern = cue_pattern()
-        for name, (_, line) in _header_lines(final).items():
-            if pattern and pattern.search(line):
-                failures.append(f"Cue placed on the {name} header line")
-    return failures
-
-
-# --- the two stages, each retried once on a failed gate ------------------------
-
-
-async def process_script(script: str) -> DocOutcome:
-    stage1 = await humanize(script)
-    if failures := check_humanize(script, stage1):
-        stage1 = await humanize(script)
-        if failures := check_humanize(script, stage1):
-            raise GateFailure("Humanize pass", failures)
-
-    stage2 = await add_emotion(stage1.text)
-    if failures := check_emotion(script, stage1.text, stage2):
-        stage2 = await add_emotion(stage1.text)
-        if failures := check_emotion(script, stage1.text, stage2):
-            raise GateFailure("Emotion pass", failures)
-
-    return build_outcome(script, stage2)
-
-
-# --- report: every number computed here, from before/after text --------------
+async def run_humanize(script: str) -> StepOutcome:
+    """Humanize pass, retried once if the gate fails."""
+    for _ in range(2):
+        result = await humanize(script)
+        cleaned, _, flags = strip_genuine(result.text)
+        failures = check_humanize(script, result, cleaned)
+        if not failures:
+            final = cleaned.strip() + "\n"
+            return StepOutcome(text=final, report_lines=humanize_report(script, final, flags))
+    raise GateFailure("Go Humanize", failures)
 
 
 def _body(text: str) -> str:
@@ -181,22 +164,117 @@ def _count_phrase(text: str, phrase: str) -> int:
 
 
 def _repeat_items(before: TextStats, after_body: str, limit: int = 4) -> list[str]:
-    """Repeated openers and phrases from the input, with how often they appear now."""
+    """Repeated openers and phrases from the input, with how often they appear now (HTML)."""
     after_openers = analyze(after_body).repeated_openers
     items: list[str] = []
     shown: list[str] = []
     for opener, count in list(before.repeated_openers.items())[:2]:
         now = after_openers.get(opener, 0)
-        items.append(f'"{opener}" x{count} → {"varied" if now <= 1 else now}')
+        items.append(f'"{esc(opener)}" x{count} → {"varied" if now <= 1 else now}')
         shown.append(opener)
     for phrase, count in before.repeated_phrases:
         if len(items) >= limit:
             break
         if any(phrase in s or s in phrase for s in shown):
             continue
-        items.append(f'"{phrase}" x{count} → {_count_phrase(after_body, phrase)}')
+        items.append(f'"{esc(phrase)}" x{count} → {_count_phrase(after_body, phrase)}')
         shown.append(phrase)
     return items
+
+
+def _double_check_line(warnings: list[str]) -> list[str]:
+    return [f"⚠️ <b>Double-check:</b> {esc(' | '.join(warnings))}"] if warnings else []
+
+
+def humanize_report(source: str, final: str, grammar_flags: list[str]) -> list[str]:
+    src_body, final_body = _body(source), strip_cues(_body(final))
+    before, after = analyze(strip_cues(src_body)), analyze(final_body)
+    scan = compare(strip_cues(src_body), final_body, length_tolerance=config.DOC_LENGTH_TOLERANCE)
+
+    lines = [f"📝 <b>Words:</b> {word_count(strip_cues(source)):,} → {word_count(strip_cues(final)):,}"]
+
+    removed = sorted(((before.fillers[k] - after.fillers[k], k) for k in FILLER_PATTERNS
+                      if before.fillers[k] > after.fillers[k]), reverse=True)
+    lines.append("🧹 <b>Filler / repeated words removed:</b> "
+                 + (", ".join(f"<b>{esc(label)}</b> x{n}" for n, label in removed[:5]) if removed else "none found"))
+
+    # Approximate: counted with the contrast regexes in rules.py (it's/that's/this is ... not ...,
+    # it's ...), so unusual phrasings can be missed or over-counted.
+    rewritten = max(len(before.contrast) - len(after.contrast), 0)
+    left = f" ({len(after.contrast)} left)" if after.contrast else ""
+    lines.append(f"🔁 <b>\"It's not X, it's Y\" lines rewritten:</b> {rewritten}{left}")
+
+    if repeats := _repeat_items(before, final_body):
+        lines.append("🔀 <b>Repeated openers varied:</b> " + ", ".join(repeats))
+
+    if existing := cue_sequence(source):
+        lines.append(f"🎭 <b>Existing cues kept:</b> {len(existing)}")
+
+    headers = _header_lines(final)
+    checks = {
+        "intro": any(line.strip() for line in final.split("\n")),
+        "outro": bool(OUTRO_RE.search(final)),
+        "Short 1": "Short 1" in headers,
+        "Short 2": "Short 2" in headers,
+        "names/numbers": not scan.facts_missing,
+    }
+    lines.append("🔎 <b>Checks:</b> " + " ".join(f"{k} {OK if v else BAD}" for k, v in checks.items()))
+
+    _, warnings = check_structure(source, final)
+    if scan.facts_missing:
+        warnings.append(f"Names/numbers missing: {', '.join(scan.facts_missing[:10])}")
+    warnings += [f'Wording where "genuine" was removed: "{s}"' for s in grammar_flags[:3]]
+    if after.contrast:
+        warnings.append(f"\"It's not X, it's Y\" line left: {after.contrast[0]}")
+    return lines + _double_check_line(warnings)
+
+
+# --- step 2: Add Emotion ---------------------------------------------------------
+
+
+def check_emotion(source: str, result: EmotionResult) -> list[str]:
+    final = result.text
+    failures: list[str] = []
+    if result.truncated:
+        failures.append("Emotion output was cut off by the model's output limit")
+    if len(cue_sequence(final)) - len(cue_sequence(source)) < 1:
+        failures.append("No emotion cues were added")
+    if GENUINE_RE.search(final):
+        failures.append('"genuine/genuinely" still present')
+
+    # a. Cues are the only change: with every cue removed, the text must equal the input
+    #    exactly after whitespace normalisation (the input's own "genuine" words excepted).
+    expected = normalise_ws(strip_cues(strip_genuine(source)[0]))
+    actual = normalise_ws(strip_cues(final))
+    if actual != expected:
+        failures.append(f"Script text changed, not just cues added: {_first_difference(expected, actual)}")
+
+    # b. Short headers, editor notes and the pronunciation list are identical and cue-free.
+    #    (A cue on one of those lines stops it matching its protected pattern, so it fails here too.)
+    def blocks(text: str) -> list[str]:  # trailing whitespace ignored (the script's final newline)
+        return [block.rstrip() for block in protect(text).blocks.values()]
+
+    if blocks(final) != blocks(source):
+        failures.append("Short headers, editor notes or the pronunciation list changed or got a cue")
+
+    # c. Every new bracketed token is a cue in the configured format.
+    pattern = cue_pattern()
+    known = set(BRACKET_TOKEN_RE.findall(source))
+    odd = [t for t in BRACKET_TOKEN_RE.findall(final) if t not in known and not (pattern and pattern.fullmatch(t))]
+    if odd:
+        failures.append(f"Cue not in the [emotion] format: {', '.join(odd[:3])}")
+    return failures
+
+
+async def run_emotion(script: str) -> StepOutcome:
+    """Emotion-cue pass only, retried once if the gate fails."""
+    for _ in range(2):
+        result = await add_emotion(script)
+        failures = check_emotion(script, result)
+        if not failures:
+            final = result.text.strip() + "\n"
+            return StepOutcome(text=final, report_lines=emotion_report(script, final, result.grammar_flags))
+    raise GateFailure("Add Emotion", failures)
 
 
 def _chapter_titles(body: str) -> list[str]:
@@ -210,7 +288,7 @@ def _chapter_titles(body: str) -> list[str]:
 
 
 def _by_section(source: str, final: str) -> str | None:
-    """Cue count per section, only when the same chapter titles are found in input and output."""
+    """Cues per section (HTML), only when the same chapter titles are found in input and output."""
     pattern = cue_pattern()
     src_titles, out_titles = _chapter_titles(_body(source)), _chapter_titles(_body(final))
     if pattern is None or len(src_titles) < 2 or [t.lower() for t in src_titles] != [t.lower() for t in out_titles]:
@@ -225,57 +303,18 @@ def _by_section(source: str, final: str) -> str | None:
         elif short:
             sections.append([short, 0])
         sections[-1][1] += len(pattern.findall(line))
-    return "By section (cues): " + " · ".join(f"{name[:28]} {count}" for name, count in sections)
+    return "🗂 <b>By section:</b> " + "; ".join(f"{esc(name[:28])}: {count}" for name, count in sections)
 
 
-def build_outcome(source: str, result: EmotionResult) -> DocOutcome:
-    final = result.text.strip() + "\n"
-    src_body = _body(source)
-    final_body = strip_cues(_body(final))
-    before, after = analyze(src_body), analyze(final_body)
-    scan = compare(src_body, final_body, length_tolerance=config.DOC_LENGTH_TOLERANCE)
-
-    lines = [f"Words: {word_count(strip_cues(source)):,} → {word_count(strip_cues(final)):,}"]
-
-    removed = sorted(((before.fillers[k] - after.fillers[k], k) for k in FILLER_PATTERNS
-                      if before.fillers[k] > after.fillers[k]), reverse=True)
-    lines.append("Filler / repeated words removed: "
-                 + (", ".join(f"{label} x{n}" for n, label in removed[:5]) if removed else "none found"))
-
-    # Approximate: counted with the contrast regexes in rules.py (it's/that's/this is ... not ...,
-    # it's ...), so unusual phrasings can be missed or over-counted.
-    rewritten = max(len(before.contrast) - len(after.contrast), 0)
-    left = f" ({len(after.contrast)} left)" if after.contrast else ""
-    lines.append(f"\"It's not X, it's Y\" lines rewritten: {rewritten}{left}")
-
-    if repeats := _repeat_items(before, final_body):
-        lines.append("Repeated openers varied: " + ", ".join(repeats))
-
-    cues_in, cues_out = cue_sequence(source), cue_sequence(final)
-    if result.skipped:
-        lines.append(f"Emotion cues: {len(cues_in)} in, {len(cues_out)} out (adding cues is off)")
-    else:
-        kinds = Counter(c[1:-1] for c in cues_out).most_common(6)
-        detail = f" ({', '.join(f'{k} {n}' for k, n in kinds)})" if kinds else ""
-        lines.append(f"Emotion cues: {len(cues_in)} in, {len(cues_out)} out{detail}")
-
-    if section_line := _by_section(source, final):
-        lines.append(section_line)
-
-    headers = _header_lines(final)
-    checks = {
-        "intro": any(line.strip() for line in final.split("\n")),
-        "outro": bool(OUTRO_RE.search(final)),
-        "Short 1": "Short 1" in headers,
-        "Short 2": "Short 2" in headers,
-        "names/numbers": not scan.facts_missing,
-    }
-    lines.append("Checks: " + ", ".join(f"{k} {'ok' if v else 'missing'}" for k, v in checks.items()))
-
-    _, warnings = check_structure(source, final)
-    if scan.facts_missing:
-        warnings.append(f"Names/numbers missing: {', '.join(scan.facts_missing[:10])}")
-    warnings += [f'Wording where "genuine" was removed: "{s}"' for s in result.grammar_flags[:3]]
-    if after.contrast:
-        warnings.append(f"\"It's not X, it's Y\" line left: {after.contrast[0]}")
-    return DocOutcome(text=final, report_lines=lines, warnings=warnings)
+def emotion_report(source: str, final: str, grammar_flags: list[str]) -> list[str]:
+    # Add Emotion refuses a Doc that already has cues, so every cue in the output is new.
+    cues = cue_sequence(final)
+    kinds = Counter(c[1:-1] for c in cues).most_common()
+    shown = ", ".join(f"{esc(k)} {n}" for k, n in kinds[:8]) + (", ..." if len(kinds) > 8 else "")
+    lines = [f"🎭 <b>Cues added:</b> {len(cues) - len(cue_sequence(source))} ({shown})"]
+    if section := _by_section(source, final):
+        lines.append(section)
+    lines.append(f"🔎 <b>Checks:</b> script text unchanged {OK} Short headers untouched {OK} "
+                 f"no cues on editor notes {OK}")
+    warnings = [f'Wording where "genuine" was removed: "{s}"' for s in grammar_flags[:3]]
+    return lines + _double_check_line(warnings)

@@ -7,92 +7,106 @@ Claude chat as usual; this bot cleans it up.
 It works on any topic (FC 27 reviews, football previews, anything else). It
 looks for language patterns, not topics.
 
-## How it works: Google Doc only
+## How it works: one Google Doc, three buttons
 
 1. Paste the Claude script into the configured Google Doc (tab `t.0`).
-   Select all, then paste, so the Doc only ever holds one script.
-2. Send **`go humanize`** to the bot in Telegram (`go humanise` and trailing
-   `!`/`.` also work; the message must be exactly that).
-3. The bot replies **"Processing…"**. That same message is later edited into
-   the report, so every run ends as one message. **No file is ever sent.**
-4. A copy of the raw script is saved to `STATE_DIR/backups/` (the newest 3
-   are kept) before anything changes.
-5. **Pass 1, Humanize** (one model call): cuts repeated and filler words,
-   varies repeated openers, rewrites "it's not X, it's Y" lines, simplifies
-   hard words.
-6. **Pass 2, Emotion** (a separate model call): adds Eleven v4 audio tags such
-   as `[thoughtful]`. Code then removes any "genuine"/"genuinely" the model
-   missed.
-7. **Validation gate** (code only). If any check fails, that pass is retried
-   once. If it fails again, the message reads "Couldn't finish: <check>. The
-   Doc was not changed."
-8. The bot replaces the tab's text in a single Google request, reads it back,
-   stores hashes of the input and the re-read output, and edits the message
-   into the report with the Doc link.
+2. Send the bot **any message**. It replies with a menu:
+   **🧹 Go Humanize** · **🎭 Add Emotion** · **🔄 Cancel / New Script**.
+   Typing `go humanize` runs Go Humanize directly. Typed text is never
+   treated as a script.
+3. **🧹 Go Humanize** cleans the wording only: it cuts repeated and filler
+   words, varies repeated openers, rewrites "it's not X, it's Y" lines,
+   simplifies hard words, and strips "genuine/genuinely" in code. It **adds no
+   cues**, and cues already in the script are kept in order. It replaces the
+   Doc and replies with the link, a report and two buttons:
+   **🎭 Add Emotion** · **🔄 Cancel / New Script**.
+4. **🎭 Add Emotion** (optional) takes the humanized script from the Doc,
+   adds Eleven v4 audio tags such as `[thoughtful]`, writes it back, and
+   replies with an emotion report. Then clear the Doc and paste the next
+   script.
+5. **🔄 Cancel / New Script** (or `/cancel`) closes the session. It never
+   reads, writes or clears the Doc. If a job is running, it stops before
+   the Doc write; once the write has happened, it's too late and the bot
+   says so.
+
+Every run ends as **one message**: the pressed menu (or a new message) turns
+into "⏳ Processing...", which is then edited into the report or into
+"Couldn't finish: <check>. The Doc was not changed." **No file is ever
+sent.** Replies use Telegram HTML, and every dynamic string is escaped.
 
 Editor notes (`[Editor note: ...]`), the `Short 1` / `Short 2` header lines
 and the `Difficult to pronounce words` list are swapped out for placeholders
 before either model call. They come back byte-for-byte and never get cues.
-Emotion cues already in a pasted script are kept, in order.
+A raw copy of the Doc is saved to `STATE_DIR/backups/` (newest 3 kept)
+before either step runs.
 
 ### Pre-flight checks (read-only, no model calls)
 
-In this order:
+**Go Humanize**, in order:
 
-1. A job is already running → "Already working on a script…"
-2. The Doc tab is empty or whitespace → "The Doc is empty…"
-3. The text matches the last input or last output (hash after collapsing
-   whitespace) → "This is the same script I already processed…"
-4. Fewer than `DOC_MIN_WORDS` words → "That's only N words…"
+1. Job already running → "⏳ Already working on a script…"
+2. Doc tab empty → "📭 The Doc is empty…"
+3. Text matches the last raw input, the last humanized output or the last
+   emotion output (hash after collapsing whitespace) → "♻️ This is the same
+   script I already processed…"
+4. The last written text is still there with new text pasted below it →
+   "⚠️ The Doc still has the old script…"
+5. Fewer than `DOC_MIN_WORDS` words → "That's only N words…"
 
-### Safety rules
+**Add Emotion**, in order: job running → empty → session cancelled → emotions
+already added → not the script Go Humanize last wrote ("Run Go Humanize on
+this script first") → already contains cues.
 
-- **Nothing in the Doc changes until the final text passes the gate.**
-- The write is locked to the Doc revision that was read. If someone edits the
-  Doc while the bot works, Google rejects the write and the Doc is untouched.
-- **Dry run** (`DOC_WRITE_ENABLED=false`, the code default): the result is
-  saved under `STATE_DIR/backups/` and the Doc is not touched.
-- The backups plus Google Docs version history mean an overwrite can always
-  be undone.
+### Session state (`STATE_DIR/state.json`)
 
-### Validation gate
+`last_input_hash`, `last_humanize_hash` and `last_emotion_hash` (hashes of
+the Doc as re-read after each write), `last_output_hash`,
+`last_written_text`, and `session_closed` (set by Cancel, cleared by the
+next successful Go Humanize). Cancel keeps the hashes, so same-script
+protection stays. On Railway this survives restarts only on a volume.
 
-| Check | Fails when |
+### Validation gates (code only, each step retried once)
+
+| Step | Fails when |
 |---|---|
-| Short headers | a `Short 1`/`Short 2` line from the input is missing, changed, out of order, or has no text after it |
-| Outro | the input has "if you like(d) watching this" and the output doesn't |
-| Chapters | "Chapter <number>" text was added |
-| genuine/genuinely | any remain (code strips them, so this is a backstop) |
-| Length | the word count, cues excluded, changes more than `DOC_LENGTH_TOLERANCE` (±15%) |
-| Cut-off | either model call hit its output limit |
-| Existing cues | Pass 1 changed the ordered sequence of cues already in the script, or Pass 2 dropped or reordered any of them |
-| Edit-only | Pass 2's text, cues removed, is less than `CUE_SIMILARITY_MIN` (90%) similar to Pass 1's output, meaning it rewrote instead of adding cues |
-| Cue placement | a cue landed on a Short header line |
+| Go Humanize | a `Short 1`/`Short 2` header is missing, changed, out of order or empty; the "if you like(d) watching this" outro disappears; "Chapter <number>" is added; the word count changes more than `DOC_LENGTH_TOLERANCE` (±15%); the output was cut off; **the ordered cue sequence differs from the input's** |
+| Add Emotion | **with every cue removed, the text differs from the input** (exact, after whitespace normalisation); a Short header, editor note or the pronunciation list changed or got a cue; a new bracketed token isn't a valid cue; no cue was added; the output was cut off; "genuine/genuinely" remains |
 
-### Report (every number computed by code)
+### Reports (every number computed by code)
 
 ```
-Script humanized
-Doc: https://docs.google.com/document/d/…/edit?tab=t.0
+✅ Script humanized
+📄 Doc: https://docs.google.com/document/d/…/edit?tab=t.0
 
-Words: 2,253 → 2,062
-Filler / repeated words removed: genuine(ly) x27, real (filler) x14, actually x10, …
-"It's not X, it's Y" lines rewritten: 4
-Repeated openers varied: "let's talk about" x13 → varied, "after two hundred hours" x5 → 1
-Emotion cues: 0 in, 31 out (analytical 6, informative 5, …)
-Checks: intro ok, outro ok, Short 1 ok, Short 2 ok, names/numbers ok
-Double-check: <anything flagged>
+📝 Words: 2,253 → 2,064
+🧹 Filler / repeated words removed: genuine(ly) x27, real (filler) x14, actually x10, …
+🔁 "It's not X, it's Y" lines rewritten: 4
+🔀 Repeated openers varied: "let's talk about" x13 → varied, …
+🔎 Checks: intro ✅ outro ✅ Short 1 ✅ Short 2 ✅ names/numbers ✅
+
+👇 Want emotion cues for ElevenLabs? Tap Add Emotion. Skip it if this video doesn't need them.
 ```
 
-The "it's not X, it's Y" count comes from regexes and is approximate. A
-per-section cue line is shown only when chapter titles are found identically
-in the input and output.
+```
+🎭 Emotions added
+📄 Doc: https://docs.google.com/document/d/…/edit?tab=t.0
+
+🎭 Cues added: 28 (analytical 5, informative 3, emphatic 3, …)
+🔎 Checks: script text unchanged ✅ Short headers untouched ✅ no cues on editor notes ✅
+
+🔄 Done. Clear the Doc, paste your next script, then send any message.
+```
+
+A "⚠️ Double-check" line appears only when something is flagged. A
+per-section cue line appears only when chapter titles are found identically
+in the input and output. The "it's not X, it's Y" count comes from regexes
+and is approximate.
 
 ## Old paste / .txt flow (off)
 
-The original `.txt` upload, paste + `/go` and `/cancel` handlers are still in
-the code but off by default. They reply "I work from the Google Doc now…".
-Set `LEGACY_TXT_FLOW=true` to turn them back on (Humanize pass only).
+The original `.txt` upload and paste + `/go` handlers are still in the code
+but off by default (`LEGACY_TXT_FLOW=false`). Uploads and `/go` reply with a
+pointer to the Doc, and typed text shows the menu.
 
 ## Prompts
 
@@ -123,8 +137,8 @@ script-humanizer/
 ├── run.py                  # entry point → bot.main.main()
 ├── bot/
 │   ├── main.py             # Telegram wiring; "go humanize" is matched before the paste handler
-│   ├── docmode.py          # go humanize: pre-flight, backup, write, one edited report message
-│   ├── docflow.py          # Pass 1 → Pass 2 → validation gate → report (no Telegram/Google code)
+│   ├── docmode.py          # menu + 3 buttons, pre-flight, session state, Cancel, one edited message
+│   ├── docflow.py          # Go Humanize and Add Emotion steps, their gates and HTML reports
 │   ├── emotion.py          # Emotion pass, shared by any entry point; genuine strip; cue helpers
 │   ├── emotion_prompt.txt  # Emotion prompt (verbatim)
 │   ├── gdoc.py             # Google Docs read / replace (service account)
