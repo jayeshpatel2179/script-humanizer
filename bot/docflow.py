@@ -18,7 +18,7 @@ from bot import config
 from bot.emotion import GENUINE_RE, EmotionResult, add_emotion, cue_pattern, strip_cues, strip_genuine
 from bot.pipeline import HumanizeResult, humanize
 from bot.protect import protect, strip_placeholders
-from bot.scan import FILLER_PATTERNS, TextStats, analyze, compare, word_count
+from bot.scan import FILLER_PATTERNS, TextStats, analyze, compare, numbers_to_digits, word_count
 
 SHORT_HEADER_RES = {
     "Short 1": re.compile(r"^\s*short\s*(?:1|one)\b", re.IGNORECASE),
@@ -159,25 +159,41 @@ def _body(text: str) -> str:
     return strip_placeholders(protect(text).text)
 
 
+def _canonical(text: str) -> str:
+    """Lowercase, numbers as digits, word-joining hyphens as spaces: "Two-hundred" -> "200"."""
+    return re.sub(r"(?<=\w)-(?=\w)", " ", numbers_to_digits(text)).lower()
+
+
 def _count_phrase(text: str, phrase: str) -> int:
-    return len(re.findall(rf"(?<!\w){re.escape(phrase)}(?!\w)", text, re.IGNORECASE))
+    """Occurrences of phrase, counting "two hundred hours", "200 hours" and "200-plus" alike."""
+    return len(re.findall(rf"(?<!\w){re.escape(_canonical(phrase))}(?!\w)", _canonical(text)))
 
 
-def _repeat_items(before: TextStats, after_body: str, limit: int = 4) -> list[str]:
-    """Repeated openers and phrases from the input, with how often they appear now (HTML)."""
-    after_openers = analyze(after_body).repeated_openers
+def _count_opener(body: str, opener: str) -> int:
+    """Paragraphs that start with opener, with the same number/hyphen handling as _count_phrase."""
+    pattern = re.compile(rf"{re.escape(_canonical(opener))}(?!\w)")
+    return sum(1 for para in body.split("\n") if pattern.match(_canonical(para.strip())))
+
+
+def _repeat_items(before: TextStats, before_body: str, after_body: str, limit: int = 4) -> list[str]:
+    """Repeated openers and phrases from the input, with how often they appear now (HTML).
+
+    Before and after are counted the same way, so rewriting "two hundred hours" as
+    "200 hours" still counts as a repeat instead of looking removed.
+    """
     items: list[str] = []
     shown: list[str] = []
-    for opener, count in list(before.repeated_openers.items())[:2]:
-        now = after_openers.get(opener, 0)
+    for opener in list(before.repeated_openers)[:2]:
+        count, now = _count_opener(before_body, opener), _count_opener(after_body, opener)
         items.append(f'"{esc(opener)}" x{count} → {"varied" if now <= 1 else now}')
         shown.append(opener)
-    for phrase, count in before.repeated_phrases:
+    for phrase, _ in before.repeated_phrases:
         if len(items) >= limit:
             break
         if any(phrase in s or s in phrase for s in shown):
             continue
-        items.append(f'"{esc(phrase)}" x{count} → {_count_phrase(after_body, phrase)}')
+        count, now = _count_phrase(before_body, phrase), _count_phrase(after_body, phrase)
+        items.append(f'"{esc(phrase)}" x{count} → {now}')
         shown.append(phrase)
     return items
 
@@ -204,7 +220,7 @@ def humanize_report(source: str, final: str, grammar_flags: list[str]) -> list[s
     left = f" ({len(after.contrast)} left)" if after.contrast else ""
     lines.append(f"🔁 <b>\"It's not X, it's Y\" lines rewritten:</b> {rewritten}{left}")
 
-    if repeats := _repeat_items(before, final_body):
+    if repeats := _repeat_items(before, strip_cues(src_body), final_body):
         lines.append("🔀 <b>Repeated openers varied:</b> " + ", ".join(repeats))
 
     if existing := cue_sequence(source):

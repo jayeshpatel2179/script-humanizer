@@ -57,7 +57,7 @@ def analyze(body: str) -> TextStats:
 def compare(before_body: str, after_body: str, length_tolerance: float) -> ScanResult:
     before, after = analyze(before_body), analyze(after_body)
     facts = extract_facts(before_body)
-    missing = [f for f in sorted(facts) if not _fact_present(f, normalise(after_body))]
+    missing = [f for f in sorted(facts) if not _fact_present(f, numbers_to_digits(normalise(after_body)))]
     change = (after.words - before.words) / before.words if before.words else 0.0
 
     warnings: list[str] = []
@@ -143,9 +143,62 @@ def _flesch(body: str) -> float:
 # --- fact check -------------------------------------------------------------
 
 
+_ONES = {w: v for w, v in NUMBER_WORDS.items() if v < 20 and not w.endswith(("st", "nd", "rd", "th"))}
+_TENS = {w: v for w, v in NUMBER_WORDS.items() if v in range(20, 100, 10) and w.endswith("ty")}
+_SCALES = {"hundred": 100, "thousand": 1000, "million": 1_000_000}
+_CARDINAL = "|".join(sorted([*_ONES, *_TENS, *_SCALES], key=len, reverse=True))
+_NUMBER_RUN_RE = re.compile(rf"\b(?:{_CARDINAL})(?:[ -]+(?:{_CARDINAL}))*\b", re.IGNORECASE)
+
+
+def _parse_number_run(words: list[str]) -> list[int]:
+    """["two", "hundred"] -> [200]; ["twenty", "twenty", "six"] -> [20, 26]; ["four", "three"] -> [4, 3]."""
+    numbers: list[int] = []
+    total = current = 0
+    started = False
+
+    def flush():
+        nonlocal total, current, started
+        if started:
+            numbers.append(total + current)
+        total = current = 0
+        started = False
+
+    for word in words:
+        if word in _SCALES:
+            scale = _SCALES[word]
+            if scale == 100:
+                current = (current or 1) * 100
+            else:
+                total += (current or 1) * scale
+                current = 0
+        else:
+            value = _ONES.get(word, _TENS.get(word))
+            last_two = current % 100
+            # A word that can't extend the current number starts a new one ("four three", "twenty twenty").
+            if started and (last_two and (value >= 10 or last_two < 20 or last_two % 10)):
+                flush()
+            current += value
+        started = True
+    flush()
+    return numbers
+
+
+def numbers_to_digits(text: str) -> str:
+    """Spelled-out cardinals to digits, so "two hundred hours" and "200 hours" compare equal."""
+    def convert(m: re.Match[str]) -> str:
+        words = [w.lower() for w in re.split(r"[ -]+", m.group(0))]
+        return " ".join(str(n) for n in _parse_number_run(words))
+
+    return _NUMBER_RUN_RE.sub(convert, text)
+
+
 def extract_facts(body: str) -> set[str]:
-    """Names (capitalised mid-sentence words) and numbers that must survive the edit."""
-    body = normalise(body)
+    """Names (capitalised mid-sentence words) and numbers that must survive the edit.
+
+    Spelled-out numbers are read as one value ("two hundred" -> "200"), so a
+    rewrite to digits doesn't look like a missing fact.
+    """
+    body = numbers_to_digits(normalise(body))
     facts: set[str] = set()
     for sentence in _SENTENCE_SPLIT_RE.split(body):
         for i, token in enumerate(_WORD_RE.findall(sentence)):

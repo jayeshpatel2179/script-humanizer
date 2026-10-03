@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import pytest
+
 from bot.protect import protect, strip_placeholders
-from bot.scan import analyze, build_report, compare, extract_facts
+from bot.scan import analyze, build_report, compare, extract_facts, numbers_to_digits
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -37,9 +39,30 @@ def test_contrast_patterns():
 
 def test_facts_include_names_and_numbers_not_sentence_starts():
     facts = extract_facts("Porto host Manchester City. They ranked ninth with 9 crosses and a four-three win.")
-    assert {"Manchester", "City", "ninth", "9", "four", "three"} <= facts
+    assert {"Manchester", "City", "ninth", "9", "4", "3"} <= facts  # "four-three" is read as 4 and 3
     assert "Porto" not in facts  # sentence start - could be any word
     assert "They" not in facts
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("after two hundred plus hours", "after 200 plus hours"),
+    ("Two-Hundred hours", "200 hours"),
+    ("the four-three defeat", "the 4 3 defeat"),
+    ("twenty twenty-six to twenty-seven", "20 26 to 27"),
+    ("one hundred five", "105"),
+    ("three thousand two hundred fifty", "3250"),
+    ("ranked ninth with nine crosses", "ranked ninth with 9 crosses"),
+    ("someone alone", "someone alone"),  # number words inside other words are left alone
+])
+def test_numbers_to_digits(text, expected):
+    assert numbers_to_digits(text) == expected
+
+
+def test_spelled_number_rewritten_as_digits_is_not_missing():
+    result = compare("After two hundred hours of play, Inter ranked ninth.",
+                     "After 200 hours of play, Inter ranked 9th.", length_tolerance=1.0)
+    assert result.facts_missing == []
+    assert compare("After two hundred hours.", "After many hours.", length_tolerance=1.0).facts_missing == ["200"]
 
 
 def test_missing_fact_is_flagged_and_number_forms_are_equivalent():

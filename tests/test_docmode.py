@@ -9,6 +9,7 @@ from bot.docflow import GateFailure, check_structure
 from bot.docmode import GO_HUMANIZE_RE
 from bot.llm import EditResult
 from bot.pipeline import HumanizeResult
+from bot.scan import analyze
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -219,6 +220,17 @@ def test_emotion_gate_catches(monkeypatch, brackets, damage, expected):
         _run(docflow.run_emotion(_humanized("real_madrid_inter.txt")))
     assert calls["n"] == 2 and info.value.stage == "Add Emotion"
     assert any(expected in f for f in info.value.failures), info.value.failures
+
+
+def test_repeats_count_digits_and_words_alike(brackets):
+    before = ("After two hundred hours, it holds up.\n\nAfter two hundred hours, the gap is big.\n\n"
+              "Two hundred hours in, it still works. The two-hundred hours show.")
+    after = ("After 200 hours, it holds up.\n\nBy now the gap is big.\n\n"
+             "At 200 hours in, it still works. The 200-hour mark shows.")
+    items = docflow._repeat_items(analyze(before), before, after)
+    assert '"after two hundred" x2 → varied' in items  # only one paragraph still opens that way
+    assert '"two hundred hours" x4 → 2' in items  # not "→ 0": "200 hours" is the same phrase
+    assert docflow._count_phrase("a 200-plus run, two-hundred plus", "two hundred plus") == 2
 
 
 def test_report_escapes_html(monkeypatch, brackets):
