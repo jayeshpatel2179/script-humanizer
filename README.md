@@ -7,48 +7,53 @@ Claude chat as usual; this bot cleans it up.
 It works on any topic (FC 27 reviews, football previews, anything else). It
 looks for language patterns, not topics.
 
-## Main flow: Google Doc mode
+## How it works: Google Doc only
 
-1. Paste the Claude script into the configured Google Doc. Select all, then
-   paste, so the Doc only ever holds one script.
+1. Paste the Claude script into the configured Google Doc (tab `t.0`).
+   Select all, then paste, so the Doc only ever holds one script.
 2. Send **`go humanize`** to the bot in Telegram (`go humanise` and trailing
    `!`/`.` also work; the message must be exactly that).
-3. The bot reads the Doc and sends you the original as a **backup file**
-   before anything changes.
-4. **Pass 1, Humanize** (one model call): cuts repeated and filler words,
+3. The bot replies **"Processing…"**. That same message is later edited into
+   the report, so every run ends as one message. **No file is ever sent.**
+4. A copy of the raw script is saved to `STATE_DIR/backups/` (the newest 3
+   are kept) before anything changes.
+5. **Pass 1, Humanize** (one model call): cuts repeated and filler words,
    varies repeated openers, rewrites "it's not X, it's Y" lines, simplifies
    hard words.
-5. **Pass 2, Emotion** (a separate model call): adds ElevenLabs delivery cues
-   such as `[thoughtful]`. Code then removes any "genuine"/"genuinely" the
-   model missed.
-6. **Validation gate** (code only). If any check fails, that pass is retried
-   once. If it fails again, **the Doc stays untouched** and you're told which
-   check failed.
-7. The bot replaces the Doc's text with the result in a single Google
-   request, reads it back to confirm, and replies with the Doc link and a
-   report.
+6. **Pass 2, Emotion** (a separate model call): adds Eleven v4 audio tags such
+   as `[thoughtful]`. Code then removes any "genuine"/"genuinely" the model
+   missed.
+7. **Validation gate** (code only). If any check fails, that pass is retried
+   once. If it fails again, the message reads "Couldn't finish: <check>. The
+   Doc was not changed."
+8. The bot replaces the tab's text in a single Google request, reads it back,
+   stores hashes of the input and the re-read output, and edits the message
+   into the report with the Doc link.
 
 Editor notes (`[Editor note: ...]`), the `Short 1` / `Short 2` header lines
 and the `Difficult to pronounce words` list are swapped out for placeholders
 before either model call. They come back byte-for-byte and never get cues.
+Emotion cues already in a pasted script are kept, in order.
+
+### Pre-flight checks (read-only, no model calls)
+
+In this order:
+
+1. A job is already running → "Already working on a script…"
+2. The Doc tab is empty or whitespace → "The Doc is empty…"
+3. The text matches the last input or last output (hash after collapsing
+   whitespace) → "This is the same script I already processed…"
+4. Fewer than `DOC_MIN_WORDS` words → "That's only N words…"
 
 ### Safety rules
 
-- **Nothing in the Doc changes until the final text passes the gate.** Any
-  failure before the write leaves the Doc as it was.
-- The write is locked to the Doc version that was read. If you edit the Doc
-  while the bot is working, Google rejects the write and the bot tells you.
-- The bot refuses to run when:
-  - the Doc is empty or under `DOC_MIN_WORDS`
-  - the Doc still holds the bot's last output
-  - the Doc already contains emotion cues (already processed, or a new
-    script pasted under an old one)
-- Only one job runs at a time. A second `go humanize` gets "already
-  processing".
-- **Dry run by default** (`DOC_WRITE_ENABLED=false`): the result is sent to
-  Telegram as a file and the Doc is not touched.
-- The backup file plus Google Docs version history mean an overwrite can
-  always be undone.
+- **Nothing in the Doc changes until the final text passes the gate.**
+- The write is locked to the Doc revision that was read. If someone edits the
+  Doc while the bot works, Google rejects the write and the Doc is untouched.
+- **Dry run** (`DOC_WRITE_ENABLED=false`, the code default): the result is
+  saved under `STATE_DIR/backups/` and the Doc is not touched.
+- The backups plus Google Docs version history mean an overwrite can always
+  be undone.
 
 ### Validation gate
 
@@ -60,27 +65,34 @@ before either model call. They come back byte-for-byte and never get cues.
 | genuine/genuinely | any remain (code strips them, so this is a backstop) |
 | Length | the word count, cues excluded, changes more than `DOC_LENGTH_TOLERANCE` (±15%) |
 | Cut-off | either model call hit its output limit |
+| Existing cues | Pass 1 changed the ordered sequence of cues already in the script, or Pass 2 dropped or reordered any of them |
 | Edit-only | Pass 2's text, cues removed, is less than `CUE_SIMILARITY_MIN` (90%) similar to Pass 1's output, meaning it rewrote instead of adding cues |
 | Cue placement | a cue landed on a Short header line |
 
 ### Report (every number computed by code)
 
 ```
-✅ Doc updated: https://docs.google.com/document/d/…/edit
+Script humanized
+Doc: https://docs.google.com/document/d/…/edit?tab=t.0
 
-Words: 2,253 → 2,062 (-8.5%)
-genuine/genuinely: 27 → 0
-Filler: actually 10→0 · real (filler) 14→0 · exact(ly) 9→0 · …
-Contrast framing: 4 → 0 · Repeated openers: 15 → 2
-Emotion cues added: 31 (12 kinds, about 1 per 3.4 sentences)
-Structure: intro ✓ · outro ✓ · Short 1 ✓ · Short 2 ✓
-Fact check: all 99 names/numbers kept
+Words: 2,253 → 2,062
+Filler / repeated words removed: genuine(ly) x27, real (filler) x14, actually x10, …
+"It's not X, it's Y" lines rewritten: 4
+Repeated openers varied: "let's talk about" x13 → varied, "after two hundred hours" x5 → 1
+Emotion cues: 0 in, 31 out (analytical 6, informative 5, …)
+Checks: intro ok, outro ok, Short 1 ok, Short 2 ok, names/numbers ok
+Double-check: <anything flagged>
 ```
 
-## Other entry point: paste or .txt (Humanize only)
+The "it's not X, it's Y" count comes from regexes and is approximate. A
+per-section cue line is shown only when chapter titles are found identically
+in the input and output.
 
-Send a `.txt` file, or paste the script and send `/go`. You get back
-`<name>_humanized.txt` and a scan report. This runs Pass 1 only.
+## Old paste / .txt flow (off)
+
+The original `.txt` upload, paste + `/go` and `/cancel` handlers are still in
+the code but off by default. They reply "I work from the Google Doc now…".
+Set `LEGACY_TXT_FLOW=true` to turn them back on (Humanize pass only).
 
 ## Prompts
 
@@ -111,12 +123,13 @@ script-humanizer/
 ├── run.py                  # entry point → bot.main.main()
 ├── bot/
 │   ├── main.py             # Telegram wiring; "go humanize" is matched before the paste handler
-│   ├── docmode.py          # go humanize: pre-flight, backup, dry run / write, report
+│   ├── docmode.py          # go humanize: pre-flight, backup, write, one edited report message
 │   ├── docflow.py          # Pass 1 → Pass 2 → validation gate → report (no Telegram/Google code)
 │   ├── emotion.py          # Emotion pass, shared by any entry point; genuine strip; cue helpers
 │   ├── emotion_prompt.txt  # Emotion prompt (verbatim)
 │   ├── gdoc.py             # Google Docs read / replace (service account)
-│   ├── intake.py           # .txt upload, paste buffering, /go, /cancel, allowlist
+│   ├── intake.py           # allowlist; old .txt / paste / /go / /cancel flow (off by default)
+│   ├── state.py            # persistent hashes + last 3 backups under STATE_DIR
 │   ├── pipeline.py         # Humanize pass: protect → edit → restore → scan
 │   ├── protect.py          # placeholder swap-out / restore
 │   ├── llm.py              # the OpenAI call
@@ -145,8 +158,11 @@ script-humanizer/
 | `GOOGLE_DOC_ID` | The ID from the Doc URL (`/d/<ID>/edit`). Empty = Doc mode off. |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | **Railway:** the whole service-account key JSON pasted in |
 | `GOOGLE_SERVICE_ACCOUNT_FILE` | **Local:** path to the key file (default `google-service-account.json`, git-ignored) |
-| `DOC_WRITE_ENABLED` | `false` (default) = dry run. `true` = actually replace the Doc. |
-| `CUE_STYLE` | `brackets` → `[thoughtful]` (ElevenLabs v3 audio tags), `parentheses` → `(thoughtful)`, `none` → no cues (genuine is still stripped) |
+| `GOOGLE_DOC_TAB_ID` | Tab to read and write. Default `t.0` (the `tab=` value in the Doc URL). |
+| `DOC_WRITE_ENABLED` | `false` (default) = dry run. **`true` = actually replace the Doc** (set this on Railway). |
+| `STATE_DIR` | Where hashes and backups live. Default `./storage`. **On Railway, point this at a volume mount** (e.g. `/data`). |
+| `LEGACY_TXT_FLOW` | `false` (default). `true` re-enables the old paste / .txt flow. |
+| `CUE_STYLE` | `brackets` → `[thoughtful]`, ElevenLabs audio tags for **Eleven v4** (the channel's model), v4 Turbo and v3, `parentheses` → `(thoughtful)`, `none` → no cues (genuine is still stripped) |
 | `DOC_MIN_WORDS` | Default `200` |
 | `DOC_LENGTH_TOLERANCE` | Default `0.15` (±15%) |
 | `CUE_SIMILARITY_MIN` | Default `0.90` |
@@ -186,8 +202,10 @@ python -m pytest                                                     # unit test
    sets the start command.
 2. Add the variables above. Paste the whole contents of the key file into
    `GOOGLE_SERVICE_ACCOUNT_JSON`.
-3. No public domain and no volume are needed. The bot uses long polling and
-   keeps no state that matters across restarts.
+3. **Add a volume** (service → Settings → Volumes → mount path `/data`) and
+   set `STATE_DIR=/data`. Without it, the "same script" hashes and the
+   backups are wiped on every redeploy or restart. No public domain is
+   needed; the bot uses long polling.
 4. **Stop the local bot before deploying.** Two copies polling the same bot
    token conflict.
 
@@ -200,7 +218,7 @@ python -m pytest                                                     # unit test
    rewording isn't measured.
 3. **The trigger is manual.** Paste a script and forget `go humanize`, and
    nothing happens.
-4. **The overwrite is destructive.** That's why there's the backup file,
+4. **The overwrite is destructive.** That's why there are the saved backups,
    pre-flight checks, the gate, the revision lock and the read-back check.
    Version history is the last fallback.
 5. **The Doc becomes plain text** after a run. Headings, bold and bullets are
@@ -211,8 +229,9 @@ python -m pytest                                                     # unit test
    minute with gpt-5.5.
 8. **Deleting "genuine" can't always fix grammar.** Where it was used as a
    predicate ("the passion is genuine."), the report flags the sentence.
-9. **Whether the cue format suits your ElevenLabs model isn't confirmed
-   yet.** `[brackets]` are v3 audio tags; older models read them aloud.
-   Change `CUE_STYLE` if needed.
+9. **Cues are written for Eleven v4.** `[brackets]` audio tags work on
+   Eleven v4, v4 Turbo and v3. Older ElevenLabs models (Multilingual v2,
+   Flash, Turbo v2.5) read them aloud, so set `CUE_STYLE=none` if you
+   switch to one of those.
 10. **The sponsor read in a script is kept.** Removing it is a generation
     job, done in the Claude chat prompt.

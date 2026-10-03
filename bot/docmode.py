@@ -1,24 +1,22 @@
 """Telegram side of Doc mode: "go humanize" reads the Google Doc, processes it
 and replaces it.
 
-Nothing in the Doc changes until the final text has passed the validation
-gate. Any failure before the write leaves the Doc untouched.
+Nothing is ever sent to Telegram as a file. Each run ends as one message:
+"Processing..." is edited into the final report (or the failure). Nothing in
+the Doc changes until the final text has passed the validation gate.
 """
 
 import asyncio
-import hashlib
-import io
 import logging
 import re
-from datetime import datetime
 
-from telegram import InputFile, LinkPreviewOptions, Update
+from telegram import LinkPreviewOptions, Message, Update
 from telegram.constants import ChatAction
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from bot import config, gdoc
+from bot import config, gdoc, state
 from bot.docflow import GateFailure, process_script
-from bot.emotion import cue_pattern
 from bot.intake import TELEGRAM_TEXT_LIMIT, is_allowed
 from bot.llm import HumanizeError
 from bot.scan import word_count
@@ -28,17 +26,10 @@ logger = logging.getLogger(__name__)
 # Whole message only: "go humanize", "Go Humanise!", " go  humanize. "
 GO_HUMANIZE_RE = re.compile(r"^\s*go\s+humani[sz]e\s*[.!]*\s*$", re.IGNORECASE)
 
-# Three or more cues means the Doc already holds processed output.
-ALREADY_PROCESSED_CUES = 3
+ASK_TO_PASTE = "Paste the script into the Doc, then send: go humanize"
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 _job_lock = asyncio.Lock()
-# Hash of the last text written to the Doc. In memory only: after a restart the
-# cue check above still catches a re-run on processed output.
-_last_written_hash: str | None = None
-
-
-def _hash(text: str) -> str:
-    return hashlib.sha256(gdoc.normalise(text).encode("utf-8")).hexdigest()
 
 
 async def on_go_humanize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -48,94 +39,101 @@ async def on_go_humanize(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not config.GOOGLE_DOC_ID:
         await message.reply_text("Doc mode isn't set up yet (GOOGLE_DOC_ID is missing).")
         return
+    # 1. Job lock
     if _job_lock.locked():
-        await message.reply_text("⏳ Already processing a script - wait for it to finish.")
+        await message.reply_text("Already working on a script. I'll send the report when it's done.")
         return
     async with _job_lock:
         typing = asyncio.create_task(_keep_typing(context, message.chat_id))
         try:
-            await _run(update)
-        except Exception:
-            logger.exception("Doc mode failed")
-            await message.reply_text("❌ Something went wrong. The Doc was not changed. Check the logs and try again.")
+            await _run(message)
         finally:
             typing.cancel()
 
 
-async def _run(update: Update) -> None:
-    global _last_written_hash
-    message = update.effective_message
-
-    # --- pre-flight (read-only) ---
+async def _run(message: Message) -> None:
+    # --- pre-flight: read-only, no model calls ---
     try:
-        snapshot = await gdoc.read_doc()
+        snapshot = await gdoc.read_doc()  # 2. read the tab
     except gdoc.DocError as exc:
-        await message.reply_text(f"❌ Couldn't read the Doc: {exc}")
+        await message.reply_text(f"Couldn't read the Doc: {exc}")
         return
     script = snapshot.text
+    if not script.strip():  # 3. empty
+        await message.reply_text(f"The Doc is empty. {ASK_TO_PASTE}")
+        return
+    saved = state.load()
+    script_hash = state.text_hash(script)
+    if script_hash in (saved.get("last_output_hash"), saved.get("last_input_hash")):  # 4. same script
+        await message.reply_text("This is the same script I already processed. Paste a new script into the Doc, "
+                                 "then send: go humanize")
+        return
     words = word_count(script)
-    if words == 0:
-        await message.reply_text("The Doc is empty - paste a script into it first, then send go humanize.")
-        return
-    if words < config.DOC_MIN_WORDS:
-        await message.reply_text(f"The Doc only has {words} words (minimum {config.DOC_MIN_WORDS}). "
-                                 "Paste the full script, then send go humanize.")
-        return
-    if _hash(script) == _last_written_hash:
-        await message.reply_text("The Doc still holds the script I already processed. "
-                                 "Select all in the Doc, paste the new script, then send go humanize.")
-        return
-    pattern = cue_pattern()
-    if pattern and len(pattern.findall(script)) >= ALREADY_PROCESSED_CUES:
-        await message.reply_text("The Doc already contains emotion cues, so it looks already processed - or a new "
-                                 "script was pasted under an old result. Select all in the Doc, paste only the new "
-                                 "script, then send go humanize.")
+    if words < config.DOC_MIN_WORDS:  # 5. too short
+        await message.reply_text(f"That's only {words} words, too short to be a script. "
+                                 f"Paste the full script into the Doc, then send: go humanize")
         return
 
-    await message.reply_text(f"📄 Read {words:,} words from the Doc. Humanizing and adding emotion - "
-                             "this takes 1–3 minutes.")
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    await message.reply_document(
-        document=InputFile(io.BytesIO((script + "\n").encode("utf-8")), filename=f"backup_{stamp}.txt"),
-        caption="Backup of the Doc before any change.",
-    )
+    # --- processing: one message, edited at the end ---
+    status = await message.reply_text(f"Processing {words:,} words... this takes about a minute.")
+    try:
+        backup = state.save_backup(script)
+        logger.info("Backed up the Doc's raw script to %s", backup)
+        report = await _process_and_write(script, script_hash, snapshot)
+    except _Failed as exc:
+        report = f"Couldn't finish: {exc}. The Doc was not changed."
+    except Exception:
+        logger.exception("Doc mode failed")
+        report = "Couldn't finish: unexpected error (details in the bot log). The Doc was not changed."
+    await _edit(status, report)
 
-    # --- processing ---
+
+class _Failed(Exception):
+    """A failure before the Doc write. The message names the check that failed."""
+
+
+async def _process_and_write(script: str, script_hash: str, snapshot: gdoc.DocSnapshot) -> str:
     try:
         outcome = await process_script(script)
     except HumanizeError as exc:
-        await message.reply_text(f"❌ {exc}\nThe Doc was not changed.")
-        return
+        raise _Failed(str(exc).rstrip(".")) from exc
     except GateFailure as exc:
-        failures = "\n".join(f"   • {f}" for f in exc.failures)
-        await message.reply_text(f"❌ {exc.stage} failed its checks twice, so the Doc was not changed:\n{failures}")
-        return
+        raise _Failed(f"{exc.stage} check failed twice - {'; '.join(exc.failures)}") from exc
 
-    report = "\n".join(outcome.report_lines)
-    if outcome.warnings:
-        report += "\n\nCheck before recording:\n" + "\n".join(f"   • {w}" for w in outcome.warnings)
-
-    # --- write ---
+    warnings = list(outcome.warnings)
     if not config.DOC_WRITE_ENABLED:
-        await message.reply_document(
-            document=InputFile(io.BytesIO(outcome.text.encode("utf-8")), filename=f"dry_run_{stamp}.txt"),
-        )
-        await message.reply_text(f"🧪 Dry run - the Doc was NOT changed.\n\n{report}"[:TELEGRAM_TEXT_LIMIT])
-        return
+        saved_to = state.save_backup(outcome.text, prefix="dry_run")
+        header = f"Dry run - the Doc was NOT changed. Result saved on the server: {saved_to.name}"
+    else:
+        try:
+            await gdoc.replace_doc(outcome.text, snapshot)
+        except gdoc.DocError as exc:
+            raise _Failed(f"writing the Doc failed - {exc}") from exc
+        # From here the Doc has changed, so failures below are reported, not raised.
+        header = "Script humanized"
+        try:
+            written = await gdoc.read_doc()
+            state.update(last_output_hash=state.text_hash(written.text), last_input_hash=script_hash)
+            if state.text_hash(written.text) != state.text_hash(outcome.text):
+                warnings.insert(0, "The Doc's text after writing doesn't exactly match what was sent - check it.")
+        except Exception:
+            logger.exception("Post-write verification failed")
+            warnings.insert(0, "The Doc was updated, but I couldn't re-read it or save its hash - check it.")
 
+    lines = [header, f"Doc: {gdoc.doc_url()}", "", *outcome.report_lines]
+    if warnings:
+        lines.append("Double-check: " + " | ".join(warnings))
+    return "\n".join(lines)
+
+
+async def _edit(status: Message, text: str) -> None:
+    text = text[:TELEGRAM_TEXT_LIMIT]
     try:
-        await gdoc.replace_doc(outcome.text, snapshot)
-    except gdoc.DocError as exc:
-        await message.reply_text(f"❌ Couldn't write the Doc: {exc}\nThe Doc was not changed.")
-        return
-
-    written = await gdoc.read_doc()
-    _last_written_hash = _hash(written.text)
-    if _hash(outcome.text) != _last_written_hash:
-        report = ("⚠️ The Doc was written, but reading it back doesn't match the expected text exactly. "
-                  "Check it - the backup above has the original.\n\n" + report)
-    await message.reply_text(f"✅ Doc updated: {gdoc.doc_url()}\n\n{report}"[:TELEGRAM_TEXT_LIMIT],
-                             link_preview_options=LinkPreviewOptions(is_disabled=True))
+        await status.edit_text(text, link_preview_options=NO_PREVIEW)
+    except TelegramError:
+        # e.g. the "Processing..." message was deleted - fall back to a new message.
+        logger.warning("Couldn't edit the status message; sending a new one", exc_info=True)
+        await status.reply_text(text, link_preview_options=NO_PREVIEW)
 
 
 async def _keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:

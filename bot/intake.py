@@ -3,6 +3,7 @@
 import asyncio
 import io
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +20,12 @@ logger = logging.getLogger(__name__)
 
 BUFFER_KEY = "paste_buffer"
 BUSY_KEY = "busy"
+POINTER_SENT_KEY = "doc_pointer_sent_at"
 TELEGRAM_TEXT_LIMIT = 4096
+
+DOC_POINTER = "I work from the Google Doc now. Paste the script into the Doc, then send: go humanize"
+# A long paste arrives as several messages - answer the first, not every chunk.
+POINTER_COOLDOWN_SECONDS = 60
 
 
 async def is_allowed(update: Update) -> bool:
@@ -36,8 +42,20 @@ async def is_allowed(update: Update) -> bool:
     return False
 
 
+async def legacy_flow_off(update: Update, context: ContextTypes.DEFAULT_TYPE, *, cooldown: bool = False) -> bool:
+    """With LEGACY_TXT_FLOW off, point the user at the Doc and return True (the handler stops)."""
+    if config.LEGACY_TXT_FLOW:
+        return False
+    now = time.monotonic()
+    last = context.chat_data.get(POINTER_SENT_KEY)
+    if not (cooldown and last is not None and now - last < POINTER_COOLDOWN_SECONDS):
+        await update.effective_message.reply_text(DOC_POINTER)
+    context.chat_data[POINTER_SENT_KEY] = now
+    return True
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_allowed(update):
+    if not await is_allowed(update) or await legacy_flow_off(update, context, cooldown=True):
         return
     buffer: list[str] = context.chat_data.setdefault(BUFFER_KEY, [])
     buffer.append(update.effective_message.text)
@@ -49,7 +67,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_go(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_allowed(update):
+    if not await is_allowed(update) or await legacy_flow_off(update, context):
         return
     buffer: list[str] = context.chat_data.get(BUFFER_KEY) or []
     if not buffer:
@@ -61,7 +79,7 @@ async def on_go(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_allowed(update):
+    if not await is_allowed(update) or await legacy_flow_off(update, context):
         return
     had = len(context.chat_data.get(BUFFER_KEY) or [])
     context.chat_data[BUFFER_KEY] = []
@@ -69,7 +87,7 @@ async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await is_allowed(update):
+    if not await is_allowed(update) or await legacy_flow_off(update, context):
         return
     message = update.effective_message
     document = message.document

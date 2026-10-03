@@ -42,8 +42,8 @@ class DocSnapshot:
     end_index: int  # body end index (includes the final newline Docs always keeps)
 
 
-def doc_url(doc_id: str | None = None) -> str:
-    return f"https://docs.google.com/document/d/{doc_id or config.GOOGLE_DOC_ID}/edit"
+def doc_url(doc_id: str | None = None, tab_id: str | None = None) -> str:
+    return f"https://docs.google.com/document/d/{doc_id or config.GOOGLE_DOC_ID}/edit?tab={tab_id or config.GOOGLE_DOC_TAB_ID}"
 
 
 def _get_service():
@@ -97,32 +97,49 @@ def _explain(exc: HttpError) -> str:
     return f"Google Docs error ({status}): {detail}"
 
 
-def _read_sync(doc_id: str) -> DocSnapshot:
+def _find_tab(tabs: list[dict], tab_id: str) -> dict | None:
+    for tab in tabs:
+        if tab.get("tabProperties", {}).get("tabId") == tab_id:
+            return tab
+        if found := _find_tab(tab.get("childTabs", []), tab_id):
+            return found
+    return None
+
+
+def _read_sync(doc_id: str, tab_id: str) -> DocSnapshot:
+    # includeTabsContent=True returns every tab under "tabs" (and no top-level "body"),
+    # so the configured tab is picked explicitly instead of relying on "first tab".
     try:
-        doc = _get_service().documents().get(documentId=doc_id).execute(num_retries=2)
+        doc = _get_service().documents().get(documentId=doc_id, includeTabsContent=True).execute(num_retries=2)
     except HttpError as exc:
         raise DocError(_explain(exc)) from exc
-    content = doc["body"]["content"]
+    tab = _find_tab(doc.get("tabs", []), tab_id)
+    if tab is None:
+        raise DocError(f"Tab {tab_id} not found in the Doc. Check GOOGLE_DOC_TAB_ID.")
+    content = tab["documentTab"]["body"]["content"]
     return DocSnapshot(text=normalise(_extract(content)), revision_id=doc["revisionId"], end_index=content[-1]["endIndex"])
 
 
-def _replace_sync(doc_id: str, new_text: str, snapshot: DocSnapshot) -> None:
+def _replace_sync(doc_id: str, tab_id: str, new_text: str, snapshot: DocSnapshot) -> None:
     new_text = _CONTROL_RE.sub("", new_text).rstrip("\n")
     length = _utf16_len(new_text)
     requests: list[dict] = []
     # The body always ends with one newline that can't be deleted, so the range stops before it.
     if snapshot.end_index - 1 > 1:
-        requests.append({"deleteContentRange": {"range": {"startIndex": 1, "endIndex": snapshot.end_index - 1}}})
+        requests.append({"deleteContentRange": {"range": {"startIndex": 1, "endIndex": snapshot.end_index - 1,
+                                                           "tabId": tab_id}}})
     if length:
-        text_range = {"startIndex": 1, "endIndex": 1 + length}
+        text_range = {"startIndex": 1, "endIndex": 1 + length, "tabId": tab_id}
         requests += [
-            {"insertText": {"location": {"index": 1}, "text": new_text}},
+            {"insertText": {"location": {"index": 1, "tabId": tab_id}, "text": new_text}},
             # Inserted paragraphs inherit the surviving paragraph's style - reset to plain text.
             {"updateParagraphStyle": {"range": text_range, "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
                                       "fields": "namedStyleType"}},
             {"deleteParagraphBullets": {"range": text_range}},
             {"updateTextStyle": {"range": text_range, "textStyle": {}, "fields": _TEXT_STYLE_FIELDS}},
         ]
+    if not requests:
+        return  # empty text into an already-empty tab: nothing to do (Google rejects an empty batch)
     body = {"requests": requests, "writeControl": {"requiredRevisionId": snapshot.revision_id}}
     try:
         # One batchUpdate: Google applies all of it or none of it. No retries - a retried
@@ -132,9 +149,9 @@ def _replace_sync(doc_id: str, new_text: str, snapshot: DocSnapshot) -> None:
         raise DocError(_explain(exc)) from exc
 
 
-async def read_doc(doc_id: str | None = None) -> DocSnapshot:
-    return await asyncio.to_thread(_read_sync, doc_id or config.GOOGLE_DOC_ID)
+async def read_doc() -> DocSnapshot:
+    return await asyncio.to_thread(_read_sync, config.GOOGLE_DOC_ID, config.GOOGLE_DOC_TAB_ID)
 
 
-async def replace_doc(new_text: str, snapshot: DocSnapshot, doc_id: str | None = None) -> None:
-    await asyncio.to_thread(_replace_sync, doc_id or config.GOOGLE_DOC_ID, new_text, snapshot)
+async def replace_doc(new_text: str, snapshot: DocSnapshot) -> None:
+    await asyncio.to_thread(_replace_sync, config.GOOGLE_DOC_ID, config.GOOGLE_DOC_TAB_ID, new_text, snapshot)

@@ -39,12 +39,16 @@ class EmotionResult:
 
 
 def cue_pattern(style: str | None = None) -> re.Pattern[str] | None:
-    """Regex for one cue in the configured style; None when cues are off."""
+    """Regex for one cue in the configured style; None when cues are off.
+
+    Up to three lowercase words, optionally comma-separated - Eleven v4 accepts
+    combined tags like [whispering, fearful].
+    """
     style = style or config.CUE_STYLE
     if style not in CUE_STYLES:
         return None
     open_, close = (re.escape(c) for c in CUE_STYLES[style])
-    return re.compile(rf"{open_}[a-z][a-z-]*(?: [a-z][a-z-]*)?{close}")
+    return re.compile(rf"{open_}[a-z][a-z-]*(?:,? [a-z][a-z-]*){{0,2}}{close}")
 
 
 def strip_cues(text: str, style: str | None = None) -> str:
@@ -80,7 +84,7 @@ def _tidy_cues(text: str, source: str) -> str:
     source - e.g. "[VAR]" - are left alone.
     """
     open_, close = (re.escape(c) for c in CUE_STYLES[config.CUE_STYLE])
-    cue_re = re.compile(rf"({open_}[A-Za-z][A-Za-z-]*(?: [A-Za-z][A-Za-z-]*)?{close})(?:[ \t]*[:\u2014\u2013-](?=\s))?")
+    cue_re = re.compile(rf"({open_}[A-Za-z][A-Za-z-]*(?:,? [A-Za-z][A-Za-z-]*){{0,2}}{close})(?:[ \t]*[:\u2014\u2013-](?=\s))?")
 
     def fix(m: re.Match[str]) -> str:
         return m.group(0) if m.group(1) in source else m.group(1).lower()

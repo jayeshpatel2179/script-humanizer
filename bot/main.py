@@ -1,9 +1,9 @@
 import logging
 
-from telegram import Update
+from telegram import LinkPreviewOptions, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from bot import config
+from bot import config, gdoc
 from bot.docmode import GO_HUMANIZE_RE, on_go_humanize
 from bot.intake import is_allowed, on_cancel, on_document, on_go, on_text
 
@@ -12,22 +12,23 @@ logging.basicConfig(format="%(asctime)s %(name)s %(levelname)s %(message)s", lev
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-HELP_TEXT = (
-    "I clean up the wording of a finished video script so it sounds human.\n\n"
-    "• Google Doc: paste the script into the Doc, then send: go humanize\n"
-    "• Send a .txt file, or paste the script and then send /go\n"
-    "• /cancel clears a half-sent paste\n\n"
-    "I remove repeated and filler words, vary repeated openers, rewrite \"it's not X, it's Y\" lines "
-    "and simplify hard words. I don't add content or change facts, structure, editor notes, "
-    "short headers or the pronunciation list.\n\n"
-    "You get back a .txt plus a short report of what changed and anything to double-check."
-)
+
+def help_text() -> str:
+    doc = gdoc.doc_url() if config.GOOGLE_DOC_ID else "(Doc not configured)"
+    return (
+        "I clean up finished video scripts so they sound human.\n\n"
+        f"1. Paste the script into the Google Doc: {doc}\n"
+        "2. Send me: go humanize\n\n"
+        "I replace the script in the Doc with the cleaned version and send you the link with a short report.\n\n"
+        "I remove repeated and filler words, vary repeated openers, rewrite \"it's not X, it's Y\" lines and "
+        "simplify hard words. Emotion cues, editor notes, short headers and the pronunciation list stay as they are."
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await is_allowed(update):
         return
-    await update.effective_message.reply_text(HELP_TEXT)
+    await update.effective_message.reply_text(help_text(), link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -56,7 +57,7 @@ def build_application() -> Application:
 def main() -> None:
     application = build_application()
     logger.info("Starting Script Humanizer bot (polling, model=%s, doc mode=%s, doc writes=%s, cues=%s)...",
-                config.OPENAI_MODEL, "on" if config.GOOGLE_DOC_ID else "off",
+                config.OPENAI_MODEL, f"tab {config.GOOGLE_DOC_TAB_ID}" if config.GOOGLE_DOC_ID else "off",
                 "ON" if config.DOC_WRITE_ENABLED else "dry run", config.CUE_STYLE)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

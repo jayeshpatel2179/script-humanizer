@@ -64,9 +64,9 @@ def test_strip_genuine_on_samples_leaves_none():
 
 def test_cue_pattern_and_strip():
     pattern = emotion.cue_pattern("brackets")
-    text = "[thoughtful] This matters. [Editor note: cut here] [very excited] Wow."
-    assert pattern.findall(text) == ["[thoughtful]", "[very excited]"]
-    assert emotion.strip_cues(text, "brackets") == "This matters. [Editor note: cut here] Wow."
+    text = "[thoughtful] This matters. [Editor note: cut here] [very excited] Wow. [whispering, fearful] Hm."
+    assert pattern.findall(text) == ["[thoughtful]", "[very excited]", "[whispering, fearful]"]
+    assert emotion.strip_cues(text, "brackets") == "This matters. [Editor note: cut here] Wow. Hm."
     assert emotion.cue_pattern("none") is None
 
 
@@ -152,9 +152,10 @@ def test_process_script_end_to_end(monkeypatch):
     for header in ("[Editor note:", "Short One. Hello editor", "Short Two. Hello editor", "Difficult to pronounce"):
         assert header in outcome.text
     report = "\n".join(outcome.report_lines)
-    assert "genuine/genuinely: 27 → 0" in report
-    assert "Structure: intro ✓ · outro ✓ · Short 1 ✓ · Short 2 ✓" in report
-    assert "Emotion cues added:" in report
+    assert "genuine(ly) x27" in report
+    assert "Checks: intro ok, outro ok, Short 1 ok, Short 2 ok, names/numbers ok" in report
+    assert "Emotion cues: 0 in, " in report
+    assert "\"let's talk about\" x13 → varied" in report
 
 
 def test_emotion_rewrite_fails_gate_after_one_retry(monkeypatch):
@@ -214,20 +215,24 @@ def test_replace_request_keeps_final_newline_and_locks_revision(monkeypatch):
     fake = _FakeDocs()
     monkeypatch.setattr(gdoc, "_get_service", lambda: fake)
     snapshot = gdoc.DocSnapshot(text="old", revision_id="rev-1", end_index=50)
-    gdoc._replace_sync("doc", "New 😀 text\n", snapshot)
+    gdoc._replace_sync("doc", "t.0", "New 😀 text\n", snapshot)
 
     requests = fake.body["requests"]
     assert fake.body["writeControl"] == {"requiredRevisionId": "rev-1"}
-    assert requests[0]["deleteContentRange"]["range"] == {"startIndex": 1, "endIndex": 49}
-    assert requests[1]["insertText"] == {"location": {"index": 1}, "text": "New 😀 text"}
+    assert requests[0]["deleteContentRange"]["range"] == {"startIndex": 1, "endIndex": 49, "tabId": "t.0"}
+    assert requests[1]["insertText"] == {"location": {"index": 1, "tabId": "t.0"}, "text": "New 😀 text"}
     # "New 😀 text" is 11 UTF-16 units (the emoji counts as 2).
-    assert requests[2]["updateParagraphStyle"]["range"] == {"startIndex": 1, "endIndex": 12}
+    assert requests[2]["updateParagraphStyle"]["range"] == {"startIndex": 1, "endIndex": 12, "tabId": "t.0"}
+    # Every request targets the tab explicitly.
+    for request in requests:
+        (body,) = request.values()
+        assert body.get("range", body.get("location"))["tabId"] == "t.0"
 
 
 def test_replace_on_empty_doc_skips_delete(monkeypatch):
     fake = _FakeDocs()
     monkeypatch.setattr(gdoc, "_get_service", lambda: fake)
-    gdoc._replace_sync("doc", "Hello", gdoc.DocSnapshot(text="", revision_id="r", end_index=2))
+    gdoc._replace_sync("doc", "t.0", "Hello", gdoc.DocSnapshot(text="", revision_id="r", end_index=2))
     assert "deleteContentRange" not in fake.body["requests"][0]
 
 
