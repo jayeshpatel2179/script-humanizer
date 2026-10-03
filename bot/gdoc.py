@@ -53,14 +53,29 @@ BAD_CREDENTIALS = ("GOOGLE_SERVICE_ACCOUNT_JSON isn't a valid service-account ke
                    "again, from { to }.")
 
 
+def _key_info() -> dict:
+    """The service-account key from GOOGLE_SERVICE_ACCOUNT_JSON.
+
+    Quotes wrapped around the whole value (some env editors keep them) are ignored.
+    Raises ValueError if it isn't a JSON object.
+    """
+    raw = config.GOOGLE_SERVICE_ACCOUNT_JSON.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"" and raw[1:2] == "{":
+        raw = raw[1:-1]
+    info = json.loads(raw)
+    if not isinstance(info, dict):
+        raise ValueError("not a JSON object")
+    return info
+
+
 def credentials_problem() -> str | None:
     """A message if Doc mode can't possibly authenticate, checked at startup. None if it looks fine."""
     if config.GOOGLE_SERVICE_ACCOUNT_JSON:
         try:
-            info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_JSON)
+            info = _key_info()
         except ValueError:
             return BAD_CREDENTIALS
-        return None if isinstance(info, dict) and info.get("private_key") and info.get("client_email") else BAD_CREDENTIALS
+        return None if info.get("private_key") and info.get("client_email") else BAD_CREDENTIALS
     if not Path(config.GOOGLE_SERVICE_ACCOUNT_FILE).is_file():
         return MISSING_CREDENTIALS
     return None
@@ -73,8 +88,7 @@ def _get_service():
             raise DocError(problem)
         try:
             if config.GOOGLE_SERVICE_ACCOUNT_JSON:
-                info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_JSON)
-                creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+                creds = service_account.Credentials.from_service_account_info(_key_info(), scopes=SCOPES)
             else:
                 creds = service_account.Credentials.from_service_account_file(config.GOOGLE_SERVICE_ACCOUNT_FILE,
                                                                               scopes=SCOPES)

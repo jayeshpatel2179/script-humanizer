@@ -13,3 +13,6 @@ google-service-account.json
 
 # Bot state: hashes and backups (persistent volume on Railway)
 storage/
+
+# Railway variables file generated locally (contains secrets) - never commit
+railway.env

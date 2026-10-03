@@ -329,3 +329,11 @@ def test_valid_looking_credentials_pass_the_startup_check(monkeypatch):
     monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON",
                         '{"type": "service_account", "client_email": "a@b.iam.gserviceaccount.com", "private_key": "k"}')
     assert gdoc.credentials_problem() is None
+
+
+@pytest.mark.parametrize("wrap", ["{}", "'{}'", '"{}"'])
+def test_credentials_accepted_with_or_without_wrapping_quotes(monkeypatch, wrap):
+    key = '{"type": "service_account", "client_email": "a@b.iam.gserviceaccount.com", "private_key": "k"}'
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON", wrap.replace("{}", key))
+    assert gdoc.credentials_problem() is None
+    assert gdoc._key_info()["client_email"] == "a@b.iam.gserviceaccount.com"
