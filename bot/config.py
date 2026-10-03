@@ -56,8 +56,12 @@ LENGTH_TOLERANCE = 0.10  # flag if the edit changes length by more than ±10%
 GOOGLE_DOC_ID = os.getenv("GOOGLE_DOC_ID", "").strip()
 # Reads and writes target this tab explicitly (the "tab=" value in the Doc URL).
 GOOGLE_DOC_TAB_ID = (os.getenv("GOOGLE_DOC_TAB_ID") or "t.0").strip()
-# Railway: paste the whole key JSON into GOOGLE_SERVICE_ACCOUNT_JSON.
-# Local: point GOOGLE_SERVICE_ACCOUNT_FILE at the downloaded key.
+# Google service-account key, first match wins:
+# - Railway (recommended): GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 = the key file base64-encoded, one line
+#   that no variable editor can mangle
+# - GOOGLE_SERVICE_ACCOUNT_JSON = the key file's JSON text
+# - Local: GOOGLE_SERVICE_ACCOUNT_FILE = path to the downloaded key
+GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE") or "google-service-account.json"
 

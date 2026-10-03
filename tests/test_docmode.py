@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import json
 import re
 from pathlib import Path
 
@@ -317,12 +319,62 @@ def test_missing_credentials_is_a_clear_doc_error(monkeypatch, no_service, tmp_p
         gdoc._read_sync("doc", "t.0")
 
 
-@pytest.mark.parametrize("value", ["{not json", '{"type": "service_account"}', '"just a string"'])
-def test_bad_credentials_json_is_a_clear_doc_error(monkeypatch, no_service, value):
+@pytest.mark.parametrize("value, expected", [
+    ("{not json", "isn't valid JSON"),
+    ('{"type": "service_account"}', "is missing client_email, private_key"),
+    ('"just a string"', "valid JSON but not a key object"),
+])
+def test_bad_credentials_json_is_a_clear_doc_error(monkeypatch, no_service, value, expected):
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "")
     monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON", value)
-    assert gdoc.credentials_problem() == gdoc.BAD_CREDENTIALS
-    with pytest.raises(gdoc.DocError, match="isn't a valid service-account key"):
+    assert expected in gdoc.credentials_problem()
+    with pytest.raises(gdoc.DocError, match=expected):
         gdoc._read_sync("doc", "t.0")
+
+
+# A throwaway key, generated for the test - never a real one.
+def _test_key_json() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+    return json.dumps({"type": "service_account", "project_id": "p", "private_key_id": "x", "private_key": pem,
+                       "client_email": "bot@p.iam.gserviceaccount.com", "client_id": "1",
+                       "token_uri": "https://oauth2.googleapis.com/token"})
+
+
+@pytest.mark.parametrize("mangle", [
+    pytest.param(lambda s: s, id="as-is"),
+    pytest.param(lambda s: s.replace("\\n", "\n"), id="escapes-turned-into-real-newlines"),
+    pytest.param(lambda s: "'" + s + "'", id="wrapped-in-single-quotes"),
+    pytest.param(lambda s: s.replace("\\", "\\\\").replace('"', '\\"'), id="escaped-once-more"),
+    pytest.param(lambda s: json.dumps(json.loads(s), indent=2), id="pasted-as-multiline-file"),
+])
+def test_key_survives_common_editor_mangling(monkeypatch, no_service, mangle):
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "")
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON", mangle(_test_key_json()))
+    assert gdoc.credentials_problem() is None
+    monkeypatch.setattr(gdoc, "build", lambda *a, **k: "service")
+    assert gdoc._get_service() == "service"  # google-auth accepted the private key
+
+
+def test_base64_key_is_preferred_and_validated(monkeypatch, no_service):
+    encoded = base64.b64encode(_test_key_json().encode()).decode()
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON", "{broken")  # ignored when base64 is set
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", encoded[:40] + "\n" + encoded[40:])
+    assert gdoc.credentials_problem() is None
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "not*base64!")
+    assert "isn't valid base64" in gdoc.credentials_problem()
+
+
+def test_error_description_never_contains_key_material(monkeypatch):
+    key = _test_key_json()
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "")
+    monkeypatch.setattr(gdoc.config, "GOOGLE_SERVICE_ACCOUNT_JSON", key[:-40])  # truncated paste
+    problem = gdoc.credentials_problem()
+    assert "isn't valid JSON" in problem and "characters" in problem
+    assert "BEGIN PRIVATE KEY" not in problem and "MII" not in problem
 
 
 def test_valid_looking_credentials_pass_the_startup_check(monkeypatch):
